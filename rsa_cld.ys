@@ -1,0 +1,13 @@
+read_verilog decrypt.v mod_exp.v spi_master.v encrypt.v spi_slave.v rsa_top.v
+hierarchy -check -top top_module
+proc; opt; fsm; opt; memory; opt;
+techmap; opt;
+dfflibmap -liberty /home/surya-gs/Surya/Technology_PDKs/NangateOpenCellLibrary_typical.lib
+abc -liberty /home/surya-gs/Surya/Technology_PDKs/NangateOpenCellLibrary_typical.lib
+clean
+stat
+show -format svg -prefix top
+//show -prefix rsa_cld top_module
+//show -prefix robot_arm
+write_verilog rsa_synth.v
+
