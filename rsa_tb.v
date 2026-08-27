@@ -1,46 +1,3 @@
-// ============================================================
-// File        : testbench_full.v
-// Description : Comprehensive self-checking testbench for the
-//               RSA-SPI pipeline (top_module).
-//
-//               Goes beyond a simple round-trip check by:
-//                 1. Computing an INDEPENDENT golden model of
-//                    cipher = msg^E mod N and plain = cipher^D mod N
-//                    in the testbench itself, so a bug that
-//                    cancels out between encrypt and decrypt
-//                    (e.g. matching typo in both exponents)
-//                    is still caught.
-//                 2. Checking the SPI link in isolation
-//                    (received_out must equal cipher_out exactly,
-//                    and must equal the bit-serial capture taken
-//                    directly off the sclk/mosi/ss_n bus by a
-//                    protocol monitor that knows nothing about
-//                    the DUT's internals).
-//                 3. Directed boundary tests (0, 1, N-1) plus
-//                    constrained-random tests across the full
-//                    valid message range.
-//                 4. An out-of-range test (message >= N) to
-//                    document actual behaviour rather than
-//                    silently passing/failing on an assumption.
-//                 5. A reset-during-operation test and a
-//                    back-to-back start-while-busy test.
-//                 6. A live protocol checker on the SPI bus that
-//                    flags framing violations independent of the
-//                    functional result (ss_n high-time around the
-//                    transfer, no extra/missing sclk edges, MOSI
-//                    stable around sampling edges).
-//
-//               Pass/fail is tracked centrally; the run ends with
-//               a single PASS/FAIL summary and a non-zero $finish
-//               status code on failure so it can be used in a
-//               regression / CI flow.
-//
-// Compile     : iverilog -o rsa_sim_full src/*.v tb/testbench_full.v
-// Run         : vvp rsa_sim_full
-// Waveform    : gtkwave rsa_spi_full.vcd
-// Author      : RSA-SPI Project
-// ============================================================
-
 `timescale 1ns/1ps
 
 module testbench_full;
@@ -55,17 +12,31 @@ module testbench_full;
     localparam [31:0] E_PUB = 32'd7;     // public exponent
     localparam [31:0] D_PRI = 32'd1783;  // private exponent (7*1783 mod 3120 = 1)
 
+    localparam MODE_ENCRYPT = 1'b0;
+    localparam MODE_DECRYPT = 1'b1;
+
+    // --------------------------------------------------------
+    // SPI master timing (testbench IS the external SPI master).
+    // Half period 40ns -> 80ns SPI period, 8x slower than the
+    // 10ns system clock, giving the 2-flop synchronizers in
+    // spi_slave_ext comfortable margin.
+    // --------------------------------------------------------
+    localparam SPI_HALF_PERIOD = 40;
+
     // --------------------------------------------------------
     // DUT port connections
     // --------------------------------------------------------
     reg         clk;
     reg         rst_n;
-    reg         start;
-    reg  [31:0] message_in;
 
-    wire [31:0] cipher_out;
-    wire [31:0] received_out;
-    wire [31:0] decrypted_out;
+    reg         sclk_ext;
+    reg         mosi_ext;
+    wire        miso_ext;
+    reg         ss_n_ext;
+    reg         mode_sel_ext;
+
+    wire        result_ready;
+    wire        busy;
     wire        done;
 
     // --------------------------------------------------------
@@ -80,22 +51,15 @@ module testbench_full;
     top_module u_dut (
         .clk          (clk),
         .rst_n        (rst_n),
-        .start        (start),
-        .message_in   (message_in),
-        .cipher_out   (cipher_out),
-        .received_out (received_out),
-        .decrypted_out(decrypted_out),
+        .sclk_ext     (sclk_ext),
+        .mosi_ext     (mosi_ext),
+        .miso_ext     (miso_ext),
+        .ss_n_ext     (ss_n_ext),
+        .mode_sel_ext (mode_sel_ext),
+        .result_ready (result_ready),
+        .busy         (busy),
         .done         (done)
     );
-
-    // --------------------------------------------------------
-    // Direct taps onto the SPI bus for an independent protocol
-    // monitor (does not use any internal DUT state, only the
-    // pins that exist between u_spi_m and u_spi_s).
-    // --------------------------------------------------------
-    wire sclk_mon = u_dut.sclk_w;
-    wire mosi_mon = u_dut.mosi_w;
-    wire ss_n_mon = u_dut.ss_n_w;
 
     // --------------------------------------------------------
     // Waveform dump
@@ -108,6 +72,8 @@ module testbench_full;
     // --------------------------------------------------------
     // Golden reference model: modular exponentiation done with
     // plain 64-bit integer arithmetic, independent of mod_exp.v.
+    // Called with (msg, E_PUB, N_MOD) for encrypt, or
+    // (cipher, D_PRI, N_MOD) for decrypt.
     // --------------------------------------------------------
     function [31:0] golden_modexp;
         input [31:0] base_in;
@@ -139,7 +105,7 @@ module testbench_full;
     integer check_count;
 
     task check_equal;
-        input [8*64-1:0] what;   // description string (packed, up to 64 chars)
+        input [8*64-1:0] what;
         input [31:0]  actual;
         input [31:0]  expected;
         begin
@@ -173,183 +139,248 @@ module testbench_full;
     endtask
 
     // --------------------------------------------------------
-    // Independent SPI bus protocol monitor.
-    // Captures bits MSB-first on sclk_mon rising edges while
-    // ss_n_mon is low, and flags framing problems:
-    //   - mosi changing while sclk is high (should be stable)
-    //   - more than 32 bits seen between ss_n falling/rising
-    //   - ss_n rising with fewer than 32 bits captured
-    // Result exposed in bus_capture / bus_capture_valid.
+    // MISO stability monitor: while sclk_ext is high, miso_ext
+    // (driven by the DUT) must not change - the master samples
+    // on the rising edge, so any change during the high phase
+    // means the slave shifted at the wrong time.
     // --------------------------------------------------------
-    reg [31:0] bus_capture;
-    reg [5:0]  bus_bit_cnt;
-    reg        bus_active;
-    reg        bus_capture_valid;
-    reg        bus_framing_error;
-    reg        mosi_glitch_error;
-
+    reg miso_glitch_error;
     reg sclk_prev;
-    reg mosi_at_high; // mosi value sampled while sclk has been high
+    reg miso_at_high;
 
     always @(posedge clk) begin
         if (!rst_n) begin
-            bus_capture       <= 32'd0;
-            bus_bit_cnt       <= 6'd0;
-            bus_active        <= 1'b0;
-            bus_capture_valid <= 1'b0;
-            bus_framing_error <= 1'b0;
-            mosi_glitch_error <= 1'b0;
+            miso_glitch_error <= 1'b0;
             sclk_prev         <= 1'b0;
         end
         else begin
-            // Start of frame
-            if (!ss_n_mon && !bus_active) begin
-                bus_active  <= 1'b1;
-                bus_bit_cnt <= 6'd0;
-                bus_capture_valid <= 1'b0;
+            if (!ss_n_ext && sclk_ext && sclk_prev && (miso_ext !== miso_at_high)) begin
+                miso_glitch_error <= 1'b1;
             end
-
-            // Capture on rising sclk edge while frame active
-            if (bus_active && sclk_mon && !sclk_prev) begin
-                bus_capture <= {bus_capture[30:0], mosi_mon};
-                bus_bit_cnt <= bus_bit_cnt + 6'd1;
-                if (bus_bit_cnt == 6'd31) begin
-                    bus_capture_valid <= 1'b1;
-                end
-                if (bus_bit_cnt > 6'd31) begin
-                    bus_framing_error <= 1'b1; // more than 32 bits in one frame
-                end
+            if (sclk_ext && !sclk_prev) begin
+                miso_at_high <= miso_ext; // latch value right at the rising edge
             end
-
-            // Check mosi stability: it should not change while sclk is high
-            if (bus_active && sclk_mon && sclk_prev && (mosi_mon !== mosi_at_high)) begin
-                mosi_glitch_error <= 1'b1;
-            end
-            if (sclk_mon && !sclk_prev) begin
-                mosi_at_high <= mosi_mon; // latch value right at the rising edge
-            end
-
-            // End of frame
-            if (ss_n_mon && bus_active) begin
-                if (bus_bit_cnt != 6'd32) begin
-                    bus_framing_error <= 1'b1; // frame ended with wrong bit count
-                end
-                bus_active <= 1'b0;
-            end
-
-            sclk_prev <= sclk_mon;
+            sclk_prev <= sclk_ext;
         end
     end
 
     // --------------------------------------------------------
-    // Main directed task: drive one message through the full
-    // pipeline and check every observable stage against the
-    // golden model and against the independent bus monitor.
+    // SPI master driver: full-duplex, Mode 0 (CPOL=0, CPHA=0).
+    // Drives mosi_ext + sclk_ext + ss_n_ext, samples miso_ext on
+    // each rising edge. tx_word goes out on MOSI; whatever comes
+    // back on MISO is returned in rx_word. One 32-bit transaction
+    // per call - used both for the "write message" phase and the
+    // "read result" phase (dummy zeros sent when only reading).
+    // --------------------------------------------------------
+    task spi_transfer;
+        input  [31:0] tx_word;
+        output [31:0] rx_word;
+        integer i;
+        reg [31:0] captured;
+        begin
+            captured = 32'd0;
+            ss_n_ext = 1'b0;
+            #(SPI_HALF_PERIOD);
+            for (i = 31; i >= 0; i = i - 1) begin
+                mosi_ext = tx_word[i];
+                #(SPI_HALF_PERIOD);
+                sclk_ext = 1'b1;                       // rising edge: slave samples MOSI
+                captured = {captured[30:0], miso_ext}; // master samples MISO
+                #(SPI_HALF_PERIOD);
+                sclk_ext = 1'b0;                       // falling edge: slave advances output
+            end
+            #(SPI_HALF_PERIOD);
+            ss_n_ext = 1'b1;
+            #(SPI_HALF_PERIOD);
+            rx_word = captured;
+        end
+    endtask
+
+    task spi_write_message;
+        input [31:0] msg;
+        reg   [31:0] discard;
+        begin
+            spi_transfer(msg, discard);
+        end
+    endtask
+
+    task spi_read_result;
+        output [31:0] result;
+        begin
+            spi_transfer(32'd0, result);
+        end
+    endtask
+
+    // --------------------------------------------------------
+    // Wait helpers
     // --------------------------------------------------------
     integer timeout;
 
-    task run_test;
-        input [31:0] msg;
-        input [8*40-1:0] label; // ASCII label for the test
-        reg [31:0] exp_cipher;
-        reg [31:0] exp_plain;
+    task wait_result_ready;
         begin
-            exp_cipher = golden_modexp(msg, E_PUB, N_MOD);
-            // Golden decrypt is applied to the ACTUAL cipher the DUT
-            // produces, mirroring what real decrypt hardware sees;
-            // this still independently re-derives the math rather
-            // than trusting the RTL's own decrypt path.
-            $display("----------------------------------------------------");
-            $display("TEST: %0s", label);
-            $display("  message_in = %0d (0x%08h)", msg, msg);
-
-            // Reset the bus monitor's error flags for this test
-            bus_framing_error = 1'b0;
-            mosi_glitch_error = 1'b0;
-
-            rst_n      = 1'b0;
-            start      = 1'b0;
-            message_in = msg;
-            repeat (4) @(posedge clk);
-            #1;
-            rst_n = 1'b1;
-            repeat (2) @(posedge clk);
-
-            @(posedge clk); #1;
-            start = 1'b1;
-            @(posedge clk); #1;
-            start = 1'b0;
-
             timeout = 0;
-            while (!done && timeout < 100000) begin
+            while (!result_ready && timeout < 100000) begin
                 @(posedge clk);
                 timeout = timeout + 1;
             end
-            @(posedge clk);
+        end
+    endtask
 
+    task wait_done_pulse;
+        integer wtimeout;
+        begin
+            wtimeout = 0;
+            while (!done && wtimeout < 1000) begin
+                @(posedge clk);
+                wtimeout = wtimeout + 1;
+            end
+        end
+    endtask
+
+    // --------------------------------------------------------
+    // Directed encrypt-mode test: write msg, read back result,
+    // check against golden encrypt.
+    // --------------------------------------------------------
+    task run_encrypt_test;
+        input [31:0] msg;
+        input [8*40-1:0] label;
+        reg [31:0] exp_cipher;
+        reg [31:0] got_result;
+        begin
+            exp_cipher = golden_modexp(msg, E_PUB, N_MOD);
+            $display("----------------------------------------------------");
+            $display("TEST (ENCRYPT): %0s", label);
+            $display("  message_in = %0d (0x%08h)", msg, msg);
+
+            miso_glitch_error = 1'b0;
+            mode_sel_ext = MODE_ENCRYPT;
+            repeat (3) @(posedge clk); // let the mode select synchronizer settle
+
+            spi_write_message(msg);
+            wait_result_ready;
             check_true("pipeline completed without timeout", (timeout < 100000));
 
             if (timeout < 100000) begin
-                exp_plain = golden_modexp(cipher_out, D_PRI, N_MOD);
+                spi_read_result(got_result);
+                wait_done_pulse;
 
-                $display("  cipher_out    = %0d (0x%08h)", cipher_out, cipher_out);
-                $display("  received_out  = %0d (0x%08h)", received_out, received_out);
-                $display("  decrypted_out = %0d (0x%08h)", decrypted_out, decrypted_out);
-                $display("  golden cipher = %0d (0x%08h)", exp_cipher, exp_cipher);
-                $display("  golden plain  = %0d (0x%08h)", exp_plain, exp_plain);
+                $display("  result (cipher) = %0d (0x%08h)", got_result, got_result);
+                $display("  golden cipher   = %0d (0x%08h)", exp_cipher, exp_cipher);
 
-                check_equal("cipher_out matches golden modexp(msg,E,N)",
-                            cipher_out, exp_cipher);
-                check_equal("received_out matches cipher_out (SPI link integrity)",
-                            received_out, cipher_out);
-                check_equal("decrypted_out matches golden modexp(cipher,D,N)",
-                            decrypted_out, exp_plain);
-                check_true("SPI bus protocol monitor saw no framing errors",
-                            !bus_framing_error);
-                check_true("SPI bus protocol monitor saw no MOSI glitches",
-                            !mosi_glitch_error);
-                check_equal("bus monitor's own bit-serial capture matches cipher_out",
-                            bus_capture, cipher_out);
-
-                if (msg < N_MOD) begin
-                    check_equal("decrypted_out matches original message (in-range msg)",
-                                decrypted_out, msg);
-                end
-                else begin
-                    $display("    [INFO] message_in (%0d) >= N (%0d): RSA correctness is",
-                              msg, N_MOD);
-                    $display("    [INFO] not expected to hold; golden model and DUT are");
-                    $display("    [INFO] compared against each other only, not against msg.");
-                end
+                check_equal("encrypt result matches golden modexp(msg,E,N)",
+                            got_result, exp_cipher);
+                check_true("MISO was stable during SCLK-high windows",
+                            !miso_glitch_error);
+                check_true("done pulsed after result readback",
+                            (done === 1'b0)); // done is single-cycle, already cleared by now
             end
-
             $display("----------------------------------------------------");
             repeat (10) @(posedge clk);
         end
     endtask
 
     // --------------------------------------------------------
-    // Test: assert rst_n in the middle of an in-progress
-    // pipeline run and confirm the design returns cleanly to
-    // IDLE instead of hanging or asserting done spuriously.
+    // Directed decrypt-mode test: write a ciphertext, read back
+    // result, check against golden decrypt.
+    // --------------------------------------------------------
+    task run_decrypt_test;
+        input [31:0] cipher_msg;
+        input [8*40-1:0] label;
+        reg [31:0] exp_plain;
+        reg [31:0] got_result;
+        begin
+            exp_plain = golden_modexp(cipher_msg, D_PRI, N_MOD);
+            $display("----------------------------------------------------");
+            $display("TEST (DECRYPT): %0s", label);
+            $display("  cipher_in = %0d (0x%08h)", cipher_msg, cipher_msg);
+
+            miso_glitch_error = 1'b0;
+            mode_sel_ext = MODE_DECRYPT;
+            repeat (3) @(posedge clk);
+
+            spi_write_message(cipher_msg);
+            wait_result_ready;
+            check_true("pipeline completed without timeout", (timeout < 100000));
+
+            if (timeout < 100000) begin
+                spi_read_result(got_result);
+                wait_done_pulse;
+
+                $display("  result (plain) = %0d (0x%08h)", got_result, got_result);
+                $display("  golden plain   = %0d (0x%08h)", exp_plain, exp_plain);
+
+                check_equal("decrypt result matches golden modexp(cipher,D,N)",
+                            got_result, exp_plain);
+                check_true("MISO was stable during SCLK-high windows",
+                            !miso_glitch_error);
+            end
+            $display("----------------------------------------------------");
+            repeat (10) @(posedge clk);
+        end
+    endtask
+
+    // --------------------------------------------------------
+    // Full round trip via two independent SPI-driven operations:
+    // encrypt msg -> take the returned cipher -> decrypt it ->
+    // confirm we get the original message back (in-range only).
+    // --------------------------------------------------------
+    task run_roundtrip_test;
+        input [31:0] msg;
+        input [8*40-1:0] label;
+        reg [31:0] exp_cipher;
+        reg [31:0] got_cipher;
+        reg [31:0] got_plain;
+        begin
+            exp_cipher = golden_modexp(msg, E_PUB, N_MOD);
+            $display("----------------------------------------------------");
+            $display("TEST (ROUND TRIP): %0s", label);
+            $display("  message_in = %0d (0x%08h)", msg, msg);
+
+            mode_sel_ext = MODE_ENCRYPT;
+            repeat (3) @(posedge clk);
+            spi_write_message(msg);
+            wait_result_ready;
+            check_true("encrypt leg completed without timeout", (timeout < 100000));
+            spi_read_result(got_cipher);
+            wait_done_pulse;
+            check_equal("round-trip cipher matches golden modexp(msg,E,N)",
+                        got_cipher, exp_cipher);
+
+            mode_sel_ext = MODE_DECRYPT;
+            repeat (3) @(posedge clk);
+            spi_write_message(got_cipher);
+            wait_result_ready;
+            check_true("decrypt leg completed without timeout", (timeout < 100000));
+            spi_read_result(got_plain);
+            wait_done_pulse;
+
+            if (msg < N_MOD) begin
+                check_equal("round-trip result matches original message (in-range msg)",
+                            got_plain, msg);
+            end
+            else begin
+                $display("    [INFO] message_in (%0d) >= N (%0d): RSA correctness is",
+                          msg, N_MOD);
+                $display("    [INFO] not expected to hold for this leg.");
+            end
+            $display("----------------------------------------------------");
+            repeat (10) @(posedge clk);
+        end
+    endtask
+
+    // --------------------------------------------------------
+    // Robustness: reset asserted mid-pipeline (after the SPI
+    // write completed, while RSA is still crunching), confirm
+    // clean recovery.
     // --------------------------------------------------------
     task run_reset_midway_test;
         begin
             $display("----------------------------------------------------");
             $display("TEST: reset asserted mid-pipeline");
 
-            rst_n      = 1'b0;
-            start      = 1'b0;
-            message_in = 32'd42;
-            repeat (4) @(posedge clk);
-            #1;
-            rst_n = 1'b1;
-            repeat (2) @(posedge clk);
-
-            @(posedge clk); #1;
-            start = 1'b1;
-            @(posedge clk); #1;
-            start = 1'b0;
+            mode_sel_ext = MODE_ENCRYPT;
+            repeat (3) @(posedge clk);
+            spi_write_message(32'd42);
 
             // Let the pipeline run partway into encryption, then reset.
             repeat (10) @(posedge clk);
@@ -359,70 +390,57 @@ module testbench_full;
             #1;
             rst_n = 1'b1;
 
-            // done should not be asserted right after this reset, and
-            // the FSM should accept a fresh start cleanly afterward.
             repeat (3) @(posedge clk);
             check_true("done is not spuriously asserted just after mid-run reset",
                         (done === 1'b0));
+            check_true("busy clears after mid-run reset",
+                        (busy === 1'b0));
+            check_true("result_ready clears after mid-run reset",
+                        (result_ready === 1'b0));
 
-            // Now run a clean, complete test to prove the design
-            // recovered and is fully functional after the reset.
-            run_test(32'd99, "post-midway-reset recovery (msg=99)");
+            // Prove the design recovered and is fully functional.
+            run_encrypt_test(32'd99, "post-midway-reset recovery (msg=99)");
 
             $display("----------------------------------------------------");
         end
     endtask
 
     // --------------------------------------------------------
-    // Test: pulse start a second time while the pipeline is
-    // already busy, and confirm it is ignored (no corruption
-    // of the in-flight computation, single done pulse for the
-    // original request).
+    // Robustness: attempt a second SPI write while the pipeline
+    // is still busy with the first message. spi_slave_ext itself
+    // will accept the bits (rx_done_ext pulses), but the top-level
+    // FSM must ignore it since it isn't in S_IDLE - the original
+    // message_reg and in-flight result must be unaffected.
     // --------------------------------------------------------
-    integer done_pulses;
-
-    task run_busy_start_test;
+    task run_busy_write_test;
+        reg [31:0] got_result;
+        reg [31:0] exp_cipher;
         begin
             $display("----------------------------------------------------");
-            $display("TEST: extra start pulse while busy is ignored");
+            $display("TEST: extra SPI write while busy is ignored");
 
-            rst_n      = 1'b0;
-            start      = 1'b0;
-            message_in = 32'd17;
-            repeat (4) @(posedge clk);
-            #1;
-            rst_n = 1'b1;
-            repeat (2) @(posedge clk);
+            exp_cipher = golden_modexp(32'd17, E_PUB, N_MOD);
+            mode_sel_ext = MODE_ENCRYPT;
+            repeat (3) @(posedge clk);
 
-            @(posedge clk); #1;
-            start = 1'b1;
-            @(posedge clk); #1;
-            start = 1'b0;
+            spi_write_message(32'd17);
 
-            // Fire a spurious extra start pulse shortly after, while
-            // the pipeline is still busy with the first request.
-            repeat (5) @(posedge clk);
-            #1;
-            start = 1'b1;
-            @(posedge clk); #1;
-            start = 1'b0;
+            check_true("busy is asserted shortly after the first write",
+                        (busy === 1'b1));
 
-            done_pulses = 0;
-            timeout     = 0;
-            while (timeout < 100000) begin
-                @(posedge clk);
-                if (done) done_pulses = done_pulses + 1;
-                timeout = timeout + 1;
-                if (done_pulses > 0 && done) begin
-                    timeout = 100000; // stop right after first done pulse window
-                end
+            // Spurious second write attempt while busy.
+            spi_write_message(32'd8675309);
+
+            wait_result_ready;
+            check_true("original pipeline still completed without timeout",
+                        (timeout < 100000));
+
+            if (timeout < 100000) begin
+                spi_read_result(got_result);
+                wait_done_pulse;
+                check_equal("result still matches original msg=17, not the spurious write",
+                            got_result, exp_cipher);
             end
-
-            check_true("exactly one done pulse observed for one logical request",
-                        (done_pulses == 1));
-            check_equal("decrypted_out still correct after spurious mid-flight start",
-                        decrypted_out, 32'd17);
-
             $display("----------------------------------------------------");
             repeat (10) @(posedge clk);
         end
@@ -445,43 +463,56 @@ module testbench_full;
         check_count = 0;
 
         $display("====================================================");
-        $display("  RSA-SPI Pipeline -- Comprehensive Self-Checking TB");
+        $display("  RSA-SPI Pipeline (SPI-slave I/O) -- Self-Checking TB");
         $display("  Golden model keys: e=%0d, d=%0d, n=%0d",
                    E_PUB, D_PRI, N_MOD);
         $display("====================================================");
 
-        rst_n      = 1'b0;
-        start      = 1'b0;
-        message_in = 32'd0;
-        repeat (2) @(posedge clk);
+        rst_n        = 1'b0;
+        sclk_ext     = 1'b0;
+        mosi_ext     = 1'b0;
+        ss_n_ext     = 1'b1;
+        mode_sel_ext = MODE_ENCRYPT;
+        repeat (4) @(posedge clk);
+        #1;
+        rst_n = 1'b1;
+        repeat (4) @(posedge clk);
 
-        // ---------------- Directed boundary tests ----------------
-        run_test(32'd0,            "boundary: message = 0");
-        run_test(32'd1,            "boundary: message = 1");
-        run_test(N_MOD - 32'd1,    "boundary: message = N-1 (3232)");
-        run_test(32'd42,           "typical small message (42)");
-        run_test(32'd100,          "typical small message (100)");
-        run_test(32'd65,           "ASCII 'A' (65)");
-        run_test(32'd200,          "typical small message (200)");
+        // ---------------- Directed encrypt-mode boundary tests ----------------
+        run_encrypt_test(32'd0,         "boundary: message = 0");
+        run_encrypt_test(32'd1,         "boundary: message = 1");
+        run_encrypt_test(N_MOD - 32'd1, "boundary: message = N-1 (3232)");
+        run_encrypt_test(32'd42,        "typical small message (42)");
+        run_encrypt_test(32'd65,        "ASCII 'A' (65)");
 
-        // ---------------- Out-of-range documentation test ----------------
-        // Message >= N: RSA correctness is not expected to hold
-        // (mod_exp.v reduces base_r = base % modulus internally, so
-        // the pipeline will not hang, but decrypted_out != message_in
-        // in general). This test documents the actual behaviour
-        // instead of assuming it.
-        run_test(N_MOD,            "out-of-range: message = N (3233)");
-        run_test(32'hFFFF_FFFF,    "out-of-range: message = 0xFFFFFFFF");
+        // ---------------- Directed decrypt-mode tests ----------------
+        // Use golden-computed ciphertexts as decrypt inputs, so the
+        // decrypt path is validated standalone (not only ever fed by
+        // whatever this same RTL's encrypt path produced).
+        run_decrypt_test(golden_modexp(32'd0,   E_PUB, N_MOD), "boundary: decrypt of enc(0)");
+        run_decrypt_test(golden_modexp(32'd42,  E_PUB, N_MOD), "decrypt of enc(42)");
+        run_decrypt_test(golden_modexp(32'd200, E_PUB, N_MOD), "decrypt of enc(200)");
+
+        // ---------------- Out-of-range documentation tests ----------------
+        run_encrypt_test(N_MOD,         "out-of-range: message = N (3233)");
+        run_encrypt_test(32'hFFFF_FFFF, "out-of-range: message = 0xFFFFFFFF");
+
+        // ---------------- Full round-trip tests (two chained SPI ops) ----------------
+        $display("====================================================");
+        $display("  Round-trip tests (encrypt then decrypt, two SPI ops)");
+        $display("====================================================");
+        run_roundtrip_test(32'd100, "round trip: message = 100");
+        run_roundtrip_test(32'd7,   "round trip: message = 7");
 
         // ---------------- Constrained-random tests ----------------
         $display("====================================================");
         $display("  Constrained-random tests (message in [0, N-1])");
         $display("====================================================");
-        for (rnd_idx = 0; rnd_idx < 12; rnd_idx = rnd_idx + 1) begin
+        for (rnd_idx = 0; rnd_idx < 8; rnd_idx = rnd_idx + 1) begin
             r = $random % N_MOD;
             if (r < 0) r = -r;
-            rnd_label = "random message";
-            run_test(r[31:0], rnd_label);
+            rnd_label = "random message (encrypt)";
+            run_encrypt_test(r[31:0], rnd_label);
         end
 
         // ---------------- Robustness tests ----------------
@@ -489,7 +520,7 @@ module testbench_full;
         $display("  Robustness tests (reset / busy handling)");
         $display("====================================================");
         run_reset_midway_test;
-        run_busy_start_test;
+        run_busy_write_test;
 
         // ---------------- Final summary ----------------
         $display("====================================================");

@@ -3,7 +3,7 @@ hierarchy -check -top top_module
 proc; opt; fsm; opt; memory; opt;
 techmap; opt;
 dfflibmap -liberty /home/surya-gs/Surya/Technology_PDKs/NangateOpenCellLibrary_typical.lib
-abc -liberty /home/surya-gs/Surya/Technology_PDKs/NangateOpenCellLibrary_typical.lib
+abc -fast -liberty /home/surya-gs/Surya/Technology_PDKs/NangateOpenCellLibrary_typical.lib
 clean
 stat
 show -format svg -prefix top
